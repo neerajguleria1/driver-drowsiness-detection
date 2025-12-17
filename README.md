@@ -73,12 +73,13 @@ Drowsiness Probability Formula
 drowsy_prob = (
     0.35*(1-df['Alertness'])+
     0.30*(df['Fatigue'])+
-    0.10*(df['R']>105).astype(int)+
+    0.10*(df['HR']>105).astype(int)+
     0.05*(df['HR']<55).astype(int)+
     0.08*(df['Speed']<50).astype(int)+
     0.07*(df['speed_change']<8).astype(int)+
     0.05*((df['prev_alertness']-df['Alertness'])>0.2).astype(int)
-)
+)     
+
 
 This ensures:
 
