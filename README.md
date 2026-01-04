@@ -1,4 +1,3 @@
-﻿README.md (FULL PROFESSIONAL VERSION)
 # 🚗 Driver Drowsiness Detection System
 Machine Learning + Feature Engineering + Real-World Simulation
 📌 Project Overview
@@ -173,4 +172,5 @@ Mobile deployment using Streamlit Cloud
 Neeraj Guleria
 Upcoming SWE @ Amazon
 Machine Learning & Deep Learning Learner
+
 Passionate about building real-world AI systems
