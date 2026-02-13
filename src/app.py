@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List
 import logging
 import time
+import uuid
+import os
 from contextlib import asynccontextmanager
 
 from src.system_pipeline import DriverSafetySystem
@@ -13,10 +15,19 @@ from src.system_pipeline import DriverSafetySystem
 # ------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ------------------------
+# ENV CONFIG
+# ------------------------
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    "models/final_driver_drowsiness_pipeline.pkl"
+)
 
 
 # ------------------------
@@ -29,8 +40,8 @@ async def lifespan(app: FastAPI):
         logger.info("Loading Driver Safety System...")
 
         app.state.system = DriverSafetySystem(
-    model_path="models/final_driver_drowsiness_pipeline.pkl"
-        )       
+            model_path=MODEL_PATH
+        )
 
         app.state.system.health_check()
 
@@ -55,18 +66,34 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+
+    trace_id = str(uuid.uuid4())
+
+    logger.exception(f"[{trace_id}] Unhandled crash: {exc}")
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "trace_id": trace_id
+        }
+    )
 
 # ------------------------
-# SCHEMAS
+# SCHEMAS (HARD VALIDATION)
 # ------------------------
 class DriverInput(BaseModel):
-    Speed: float
-    Alertness: float
-    Seatbelt: int
-    Heart_rate: float
-    Fatigue: int
-    speed_change: float
-    prev_alertness: float
+    Speed: float = Field(..., ge=0, le=200)
+    Alertness: float = Field(..., ge=0.0, le=1.0)
+    Seatbelt: int = Field(..., ge=0, le=1)
+    HR: float = Field(..., ge=30, le=200)
+    Fatigue: int = Field(..., ge=0, le=10)
+    speed_change: float = Field(..., ge=0)
+    prev_alertness: float = Field(..., ge=0.0, le=1.0)
 
 
 class Decision(BaseModel):
@@ -82,46 +109,69 @@ class DriverAnalysisResponse(BaseModel):
     risk_state: str
     decision: Decision
     explanations: List[str]
+    trace_id: str
 
 
 # ------------------------
-# ROUTES
+# HEALTH ENDPOINT (DEEP CHECK)
 # ------------------------
+@app.get("/health")
+def deep_health(request: Request):
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "ok",
-        "message": "Driver Safety System is live 🚀"
-    }
+    try:
+        request.app.state.system.health_check()
+        return {"status": "healthy"}
+
+    except Exception as e:
+        logger.critical(f"Health check failed: {e}")
+
+        raise HTTPException(
+            status_code=503,
+            detail="System unhealthy"
+        )
 
 
+# ------------------------
+# MAIN INFERENCE ROUTE
+# ------------------------
 @app.post("/v1/analyze", response_model=DriverAnalysisResponse)
 def analyze_driver(request: Request, input_data: DriverInput):
 
     system = request.app.state.system
+    trace_id = str(uuid.uuid4())
     start_time = time.time()
 
     try:
         logger.info(
-            f"Request received | speed={input_data.Speed} "
-            f"fatigue={input_data.Fatigue}"
+            f"[{trace_id}] Request received | "
+            f"speed={input_data.Speed} fatigue={input_data.Fatigue}"
         )
 
-        result = system.analyze(input_data.dict())
+        # Use model_dump for modern Pydantic
+        result = system.analyze(input_data.model_dump())
 
         latency = time.time() - start_time
-        logger.info(f"Inference latency: {latency:.3f}s")
 
+        if latency > 1:
+            logger.warning(f"[{trace_id}] HIGH latency: {latency:.3f}s")
+        else:
+            logger.info(f"[{trace_id}] latency: {latency:.3f}s")
+
+        result["trace_id"] = trace_id
         return result
 
-    # Client mistakes → 400
+    # Client error
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.warning(f"[{trace_id}] Validation error: {e}")
 
-    # Server failures → 500
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    # Server error
     except Exception:
-        logger.exception("Inference failed")
+        logger.exception(f"[{trace_id}] Inference failed")
 
         raise HTTPException(
             status_code=500,
