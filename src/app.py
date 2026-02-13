@@ -6,6 +6,7 @@ import time
 import uuid
 import os
 from contextlib import asynccontextmanager
+from fastapi.responses import JSONResponse
 
 from src.system_pipeline import DriverSafetySystem
 
@@ -66,8 +67,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-from fastapi.responses import JSONResponse
 
+# ------------------------
+# GLOBAL CRASH HANDLER
+# ------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
 
@@ -83,8 +86,9 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
+
 # ------------------------
-# SCHEMAS (HARD VALIDATION)
+# SCHEMAS
 # ------------------------
 class DriverInput(BaseModel):
     Speed: float = Field(..., ge=0, le=200)
@@ -113,8 +117,16 @@ class DriverAnalysisResponse(BaseModel):
 
 
 # ------------------------
-# HEALTH ENDPOINT (DEEP CHECK)
+# HEALTH ROUTES
 # ------------------------
+@app.get("/")
+def health_check():
+    return {
+        "status": "ok",
+        "message": "Driver Safety System is live 🚀"
+    }
+
+
 @app.get("/health")
 def deep_health(request: Request):
 
@@ -147,7 +159,6 @@ def analyze_driver(request: Request, input_data: DriverInput):
             f"speed={input_data.Speed} fatigue={input_data.Fatigue}"
         )
 
-        # Use model_dump for modern Pydantic
         result = system.analyze(input_data.model_dump())
 
         latency = time.time() - start_time
@@ -160,7 +171,6 @@ def analyze_driver(request: Request, input_data: DriverInput):
         result["trace_id"] = trace_id
         return result
 
-    # Client error
     except ValueError as e:
         logger.warning(f"[{trace_id}] Validation error: {e}")
 
@@ -169,7 +179,6 @@ def analyze_driver(request: Request, input_data: DriverInput):
             detail=str(e)
         )
 
-    # Server error
     except Exception:
         logger.exception(f"[{trace_id}] Inference failed")
 
