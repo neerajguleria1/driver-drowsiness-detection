@@ -2,6 +2,8 @@ import joblib
 import numpy as np
 import pandas as pd
 import logging
+import threading
+import time
 from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -9,8 +11,10 @@ logger = logging.getLogger(__name__)
 
 class DriverSafetySystem:
     """
-    Production-grade Explainable Decision Intelligence System.
-    Stateless. Thread-safe. Interview-ready.
+    Production-grade Explainable + Monitored Decision Intelligence System.
+    Stateless inference.
+    Thread-safe metrics.
+    Interview-ready.
     """
 
     # ------------------------
@@ -48,6 +52,12 @@ class DriverSafetySystem:
             self.model_version = "rf_v1.0"
             self.model_type = type(model_step).__name__
 
+            # Monitoring state (thread-safe)
+            self._metrics_lock = threading.Lock()
+            self.total_requests = 0
+            self.total_drowsy = 0
+            self.total_latency = 0.0
+
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
 
@@ -76,14 +86,15 @@ class DriverSafetySystem:
     # ------------------------
     def analyze(self, input_data: Dict) -> Dict:
 
-        self._validate_input(input_data)
+        start_time = time.time()
 
+        self._validate_input(input_data)
         features = self._prepare_features(input_data)
 
         try:
             probabilities = self.model.predict_proba(features)[0]
-        except Exception as e:
-            raise RuntimeError(f"Inference failure: {e}")
+        except Exception:
+            raise RuntimeError("Model inference failure")
 
         pred_index = int(np.argmax(probabilities))
 
@@ -108,6 +119,15 @@ class DriverSafetySystem:
 
         top_features = self._get_top_contributors(features)
 
+        latency = time.time() - start_time
+
+        # Thread-safe metrics update
+        with self._metrics_lock:
+            self.total_requests += 1
+            self.total_latency += latency
+            if ml_prediction == "Drowsy":
+                self.total_drowsy += 1
+
         return {
             "ml_prediction": ml_prediction,
             "ml_confidence": ml_confidence,
@@ -119,7 +139,8 @@ class DriverSafetySystem:
             "top_contributing_features": top_features,
             "explanations": explanations,
             "model_version": self.model_version,
-            "model_type": self.model_type
+            "model_type": self.model_type,
+            "inference_latency_ms": round(latency * 1000, 2)
         }
 
     # ------------------------
@@ -140,7 +161,7 @@ class DriverSafetySystem:
         return pd.DataFrame([data])[self.MODEL_FEATURES]
 
     # ------------------------
-    # RISK ENGINE (STATELESS)
+    # RISK ENGINE
     # ------------------------
     def _compute_risk_score(
         self,
@@ -299,3 +320,43 @@ class DriverSafetySystem:
         )
 
         return reasons
+
+    # ------------------------
+    # METRICS
+    # ------------------------
+    def get_metrics(self):
+
+        with self._metrics_lock:
+            total = self.total_requests
+            drowsy = self.total_drowsy
+            total_latency = self.total_latency
+
+        avg_latency = (
+            total_latency / total
+            if total > 0 else 0
+        )
+
+        return {
+            "total_requests": total,
+            "drowsy_predictions": drowsy,
+            "average_latency_ms": round(avg_latency * 1000, 2)
+        }
+
+    # ------------------------
+    # DIAGNOSTICS
+    # ------------------------
+    def diagnostics(self):
+
+        with self._metrics_lock:
+            total = self.total_requests
+            drowsy = self.total_drowsy
+
+        return {
+            "model_loaded": self.model is not None,
+            "total_requests": total,
+            "drowsy_ratio": (
+                drowsy / total if total > 0 else 0
+            ),
+            "model_version": self.model_version,
+            "model_type": self.model_type
+        }
