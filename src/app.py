@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List
 import logging
@@ -57,12 +58,12 @@ async def lifespan(app: FastAPI):
 
 
 # ------------------------
-# APP INIT
+# APP INIT (CRITICAL)
 # ------------------------
 app = FastAPI(
     title="Cognitive Driver Safety System",
     description="Production-grade explainable decision intelligence API",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -70,14 +71,10 @@ app = FastAPI(
 # ------------------------
 # GLOBAL ERROR HANDLER
 # ------------------------
-from fastapi.responses import JSONResponse
-
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
 
     trace_id = str(uuid.uuid4())
-
     logger.exception(f"[{trace_id}] Unhandled crash: {exc}")
 
     return JSONResponse(
@@ -127,6 +124,7 @@ class DriverAnalysisResponse(BaseModel):
     explanations: List[str]
     model_version: str
     model_type: str
+    inference_latency_ms: float
     trace_id: str
 
 
@@ -140,9 +138,7 @@ def deep_health(request: Request):
         request.app.state.system.health_check()
         return {"status": "healthy"}
 
-    except Exception as e:
-        logger.critical(f"Health check failed: {e}")
-
+    except Exception:
         raise HTTPException(
             status_code=503,
             detail="System unhealthy"
@@ -160,26 +156,15 @@ def analyze_driver(request: Request, input_data: DriverInput):
     start_time = time.time()
 
     try:
-        logger.info(
-            f"[{trace_id}] Request received | "
-            f"speed={input_data.Speed} fatigue={input_data.Fatigue}"
-        )
-
         result = system.analyze(input_data.model_dump())
 
-        latency = time.time() - start_time
-
-        if latency > 1:
-            logger.warning(f"[{trace_id}] HIGH latency: {latency:.3f}s")
-        else:
-            logger.info(f"[{trace_id}] latency: {latency:.3f}s")
+        total_latency = time.time() - start_time
+        logger.info(f"[{trace_id}] total_request_latency: {total_latency:.3f}s")
 
         result["trace_id"] = trace_id
         return result
 
     except ValueError as e:
-        logger.warning(f"[{trace_id}] Validation error: {e}")
-
         raise HTTPException(
             status_code=400,
             detail=str(e)
@@ -187,8 +172,23 @@ def analyze_driver(request: Request, input_data: DriverInput):
 
     except Exception:
         logger.exception(f"[{trace_id}] Inference failed")
-
         raise HTTPException(
             status_code=500,
             detail="Internal inference error"
         )
+
+
+# ------------------------
+# METRICS ENDPOINT
+# ------------------------
+@app.get("/v1/metrics")
+def metrics(request: Request):
+    return request.app.state.system.get_metrics()
+
+
+# ------------------------
+# DIAGNOSTICS ENDPOINT
+# ------------------------
+@app.get("/v1/diagnostics")
+def diagnostics(request: Request):
+    return request.app.state.system.diagnostics()
