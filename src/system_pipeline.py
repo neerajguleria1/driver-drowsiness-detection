@@ -2,15 +2,15 @@ import joblib
 import numpy as np
 import pandas as pd
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class DriverSafetySystem:
     """
-    Production-grade Decision Intelligence System.
-    ML is only ONE component.
+    Production-grade Explainable Decision Intelligence System.
+    Stateless. Thread-safe. Interview-ready.
     """
 
     # ------------------------
@@ -30,6 +30,24 @@ class DriverSafetySystem:
                     "Model missing feature_names_in_. Retrain with sklearn >=1.0"
                 )
 
+            # Extract feature importance safely
+            model_step = None
+
+            if hasattr(self.model, "named_steps"):
+                model_step = self.model.named_steps.get("model")
+
+            if model_step is None:
+                model_step = self.model
+
+            if hasattr(model_step, "feature_importances_"):
+                self.feature_importances = model_step.feature_importances_
+            else:
+                self.feature_importances = None
+
+            # Metadata
+            self.model_version = "rf_v1.0"
+            self.model_type = type(model_step).__name__
+
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
 
@@ -41,23 +59,17 @@ class DriverSafetySystem:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
-        try:
-            dummy_data = {feature: 0 for feature in self.MODEL_FEATURES}
+        dummy_data = {feature: 0 for feature in self.MODEL_FEATURES}
 
-            # override realistic values
-            dummy_data.update({
-                "Alertness": 1,
-                "Seatbelt": 1,
-                "HR": 70,
-                "prev_alertness": 1
-            })
+        dummy_data.update({
+            "Alertness": 1,
+            "Seatbelt": 1,
+            "HR": 70,
+            "prev_alertness": 1
+        })
 
-            dummy = pd.DataFrame([dummy_data])[self.MODEL_FEATURES]
-
-            self.model.predict(dummy)
-
-        except Exception as e:
-            raise RuntimeError(f"Model unhealthy: {e}")
+        dummy = pd.DataFrame([dummy_data])[self.MODEL_FEATURES]
+        self.model.predict(dummy)
 
     # ------------------------
     # MAIN ENTRY
@@ -79,22 +91,35 @@ class DriverSafetySystem:
         ml_confidence = float(probabilities[pred_index])
         ml_confidence = min(max(ml_confidence, 0.0), 1.0)
 
-        risk_score = self._compute_risk_score(input_data, ml_confidence)
+        # Stateless risk scoring
+        risk_score, risk_factors = self._compute_risk_score(
+            input_data,
+            ml_confidence
+        )
+
         risk_state = self._map_risk_state(risk_score)
         decision = self._decision_engine(risk_state)
+
         explanations = self._generate_explanations(
             input_data,
             ml_prediction,
             ml_confidence
         )
 
+        top_features = self._get_top_contributors(features)
+
         return {
             "ml_prediction": ml_prediction,
             "ml_confidence": ml_confidence,
+            "confidence_level": self._interpret_confidence(ml_confidence),
             "risk_score": risk_score,
             "risk_state": risk_state,
+            "risk_factors": risk_factors,
             "decision": decision,
-            "explanations": explanations
+            "top_contributing_features": top_features,
+            "explanations": explanations,
+            "model_version": self.model_version,
+            "model_type": self.model_type
         }
 
     # ------------------------
@@ -105,20 +130,8 @@ class DriverSafetySystem:
         required = set(self.MODEL_FEATURES)
         provided = set(data.keys())
 
-        if required != provided:
+        if not required.issubset(provided):
             raise ValueError("Input schema mismatch detected")
-
-        if not 0 <= data["Alertness"] <= 1:
-            raise ValueError("Alertness must be between 0 and 1")
-
-        if not 0 <= data["Speed"] <= 200:
-            raise ValueError("Speed must be between 0 and 200")
-
-        if not 30 <= data["HR"] <= 200:
-            raise ValueError("Heart rate out of range")
-
-        if not 0 <= data["Fatigue"] <= 10:
-            raise ValueError("Fatigue must be between 0 and 10")
 
     # ------------------------
     # FEATURE PREP
@@ -127,44 +140,44 @@ class DriverSafetySystem:
         return pd.DataFrame([data])[self.MODEL_FEATURES]
 
     # ------------------------
-    # RISK ENGINE
+    # RISK ENGINE (STATELESS)
     # ------------------------
-    def _compute_risk_score(self, data: Dict, confidence: float) -> int:
+    def _compute_risk_score(
+        self,
+        data: Dict,
+        confidence: float
+    ) -> Tuple[int, List[str]]:
 
         score = 0
+        risk_factors = []
 
         if data["Fatigue"] > 6:
             score += 30
+            risk_factors.append("High fatigue")
 
         if data["Alertness"] < 0.5:
             score += 25
+            risk_factors.append("Low alertness")
 
         if data["HR"] > 100:
             score += 15
+            risk_factors.append("Elevated heart rate")
 
         if confidence < 0.55:
             score += 25
+            risk_factors.append("Model uncertainty")
 
         alert_drop = data["prev_alertness"] - data["Alertness"]
 
         if alert_drop > 0.25:
             score += 20
-
-        if abs(alert_drop) > 0.5:
-            score += 15
-
-        if np.isnan(confidence):
-            score += 30
+            risk_factors.append("Rapid alertness drop")
 
         if data["Speed"] == 0 and data["Fatigue"] > 7:
             score += 20
+            risk_factors.append("Stationary but highly fatigued")
 
-        # Signal smoothing
-        self.previous_score = getattr(self, "previous_score", score)
-        score = int(0.7 * self.previous_score + 0.3 * score)
-        self.previous_score = score
-
-        return max(0, min(score, 100))
+        return max(0, min(score, 100)), risk_factors
 
     # ------------------------
     # RISK STATE
@@ -203,7 +216,55 @@ class DriverSafetySystem:
         return decisions[state]
 
     # ------------------------
-    # EXPLAINABILITY
+    # CONFIDENCE INTERPRETATION
+    # ------------------------
+    def _interpret_confidence(self, confidence: float) -> str:
+
+        if confidence >= 0.85:
+            return "Very High"
+        elif confidence >= 0.7:
+            return "High"
+        elif confidence >= 0.55:
+            return "Moderate"
+        return "Low"
+
+    # ------------------------
+    # LOCAL FEATURE CONTRIBUTION
+    # ------------------------
+    def _get_top_contributors(self, input_df: pd.DataFrame):
+
+        if self.feature_importances is None:
+            return []
+
+        feature_values = input_df.iloc[0].values
+        feature_names = input_df.columns
+        importances = self.feature_importances
+
+        weighted_scores = []
+
+        for name, value, importance in zip(
+            feature_names,
+            feature_values,
+            importances
+        ):
+            contribution = abs(value * importance)
+
+            weighted_scores.append({
+                "feature": name,
+                "feature_value": float(value),
+                "global_importance": float(round(importance, 4)),
+                "local_contribution_score": float(round(contribution, 4))
+            })
+
+        weighted_scores.sort(
+            key=lambda x: x["local_contribution_score"],
+            reverse=True
+        )
+
+        return weighted_scores[:3]
+
+    # ------------------------
+    # EXPLANATION ENGINE
     # ------------------------
     def _generate_explanations(
         self,
@@ -223,15 +284,18 @@ class DriverSafetySystem:
         if data["HR"] > 100:
             reasons.append("Heart rate indicates stress")
 
-        if confidence < 0.55:
-            reasons.append(
-                "Model uncertainty detected — driver may be transitioning to drowsy"
-            )
-
         if (data["prev_alertness"] - data["Alertness"]) > 0.25:
             reasons.append("Rapid drop in alertness detected")
 
         if prediction == "Drowsy":
             reasons.append("ML model detected drowsiness pattern")
+
+        reasons.append(
+            f"Prediction confidence: {round(confidence * 100, 2)}%"
+        )
+
+        reasons.append(
+            f"Confidence category: {self._interpret_confidence(confidence)}"
+        )
 
         return reasons

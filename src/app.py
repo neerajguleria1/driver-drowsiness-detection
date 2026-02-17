@@ -61,12 +61,17 @@ async def lifespan(app: FastAPI):
 # ------------------------
 app = FastAPI(
     title="Cognitive Driver Safety System",
-    description="Production-grade decision intelligence API",
-    version="1.0.0",
+    description="Production-grade explainable decision intelligence API",
+    version="2.0.0",
     lifespan=lifespan
 )
 
+
+# ------------------------
+# GLOBAL ERROR HANDLER
+# ------------------------
 from fastapi.responses import JSONResponse
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -83,8 +88,9 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
+
 # ------------------------
-# SCHEMAS (HARD VALIDATION)
+# SCHEMAS
 # ------------------------
 class DriverInput(BaseModel):
     Speed: float = Field(..., ge=0, le=200)
@@ -102,18 +108,30 @@ class Decision(BaseModel):
     message: str
 
 
+class FeatureContribution(BaseModel):
+    feature: str
+    feature_value: float
+    global_importance: float
+    local_contribution_score: float
+
+
 class DriverAnalysisResponse(BaseModel):
     ml_prediction: str
     ml_confidence: float
+    confidence_level: str
     risk_score: int
     risk_state: str
+    risk_factors: List[str]
     decision: Decision
+    top_contributing_features: List[FeatureContribution]
     explanations: List[str]
+    model_version: str
+    model_type: str
     trace_id: str
 
 
 # ------------------------
-# HEALTH ENDPOINT (DEEP CHECK)
+# HEALTH ENDPOINT
 # ------------------------
 @app.get("/health")
 def deep_health(request: Request):
@@ -147,7 +165,6 @@ def analyze_driver(request: Request, input_data: DriverInput):
             f"speed={input_data.Speed} fatigue={input_data.Fatigue}"
         )
 
-        # Use model_dump for modern Pydantic
         result = system.analyze(input_data.model_dump())
 
         latency = time.time() - start_time
@@ -160,7 +177,6 @@ def analyze_driver(request: Request, input_data: DriverInput):
         result["trace_id"] = trace_id
         return result
 
-    # Client error
     except ValueError as e:
         logger.warning(f"[{trace_id}] Validation error: {e}")
 
@@ -169,7 +185,6 @@ def analyze_driver(request: Request, input_data: DriverInput):
             detail=str(e)
         )
 
-    # Server error
     except Exception:
         logger.exception(f"[{trace_id}] Inference failed")
 
