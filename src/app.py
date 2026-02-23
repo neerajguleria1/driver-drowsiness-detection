@@ -177,10 +177,24 @@ def analyze_driver(request: Request, input_data: DriverInput):
             detail="Internal inference error"
         )
 
-
+        
 # ------------------------
 # METRICS ENDPOINT
 # ------------------------
+@app.post("/v1/analyze/batch")
+def analyze_batch(request: Request, inputs: List[DriverInput]):
+
+    system = request.app.state.system
+
+    results = system.analyze_batch(
+        [item.model_dump() for item in inputs]
+    )
+
+    return {
+        "total_processed": len(results),
+        "results": results
+    }
+
 @app.get("/v1/metrics")
 def metrics(request: Request):
     return request.app.state.system.get_metrics()

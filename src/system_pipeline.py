@@ -143,6 +143,54 @@ class DriverSafetySystem:
             "inference_latency_ms": round(latency * 1000, 2)
         }
 
+    def analyze_batch(self, inputs: List[Dict]) -> List[Dict]:
+        if not inputs:
+            return []
+
+        start_time = time.time()
+        validated = [self._validate_input(data) or data for data in inputs]
+        df = pd.DataFrame(validated)[self.MODEL_FEATURES]
+
+        try:
+            probabilities = self.model.predict_proba(df)
+        except Exception:
+            raise RuntimeError("Batch model inference failure")
+
+        results = [
+            self._process_single_result(data, probabilities[i], df.iloc[[i]])
+            for i, data in enumerate(validated)
+        ]
+
+        self._update_batch_metrics(results, time.time() - start_time)
+        return results
+
+    def _process_single_result(self, data: Dict, prob: np.ndarray, single_df: pd.DataFrame) -> Dict:
+        pred_index = int(np.argmax(prob))
+        ml_prediction = "Drowsy" if pred_index == 1 else "Alert"
+        ml_confidence = float(np.clip(prob[pred_index], 0.0, 1.0))
+
+        risk_score, risk_factors = self._compute_risk_score(data, ml_confidence)
+        risk_state = self._map_risk_state(risk_score)
+
+        return {
+            "ml_prediction": ml_prediction,
+            "ml_confidence": ml_confidence,
+            "confidence_level": self._interpret_confidence(ml_confidence),
+            "risk_score": risk_score,
+            "risk_state": risk_state,
+            "risk_factors": risk_factors,
+            "decision": self._decision_engine(risk_state),
+            "top_contributing_features": self._get_top_contributors(single_df),
+            "explanations": self._generate_explanations(data, ml_prediction, ml_confidence),
+            "model_version": self.model_version,
+            "model_type": self.model_type,
+        }
+
+    def _update_batch_metrics(self, results: List[Dict], latency: float):
+        with self._metrics_lock:
+            self.total_requests += len(results)
+            self.total_latency += latency
+            self.total_drowsy += sum(1 for r in results if r["ml_prediction"] == "Drowsy")
     # ------------------------
     # VALIDATION
     # ------------------------
