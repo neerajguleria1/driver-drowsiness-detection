@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 import os
+import asyncio
 from contextlib import asynccontextmanager
 
 from src.system_pipeline import DriverSafetySystem
@@ -149,14 +150,18 @@ def deep_health(request: Request):
 # MAIN INFERENCE ROUTE
 # ------------------------
 @app.post("/v1/analyze", response_model=DriverAnalysisResponse)
-def analyze_driver(request: Request, input_data: DriverInput):
+async def analyze_driver(request: Request, input_data: DriverInput):
 
     system = request.app.state.system
+
     trace_id = str(uuid.uuid4())
     start_time = time.time()
 
     try:
-        result = system.analyze(input_data.model_dump())
+        result = await asyncio.to_thread(
+            system.analyze,
+            input_data.model_dump()
+        )
 
         total_latency = time.time() - start_time
         logger.info(f"[{trace_id}] total_request_latency: {total_latency:.3f}s")
@@ -165,24 +170,16 @@ def analyze_driver(request: Request, input_data: DriverInput):
         return result
 
     except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=400, detail=str(e))
 
     except Exception:
         logger.exception(f"[{trace_id}] Inference failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal inference error"
-        )
-
-        
+        raise HTTPException(status_code=500, detail="Internal inference error")        
 # ------------------------
 # METRICS ENDPOINT
 # ------------------------
 @app.post("/v1/analyze/batch")
-def analyze_batch(request: Request, inputs: List[DriverInput]):
+async def analyze_batch(request: Request, inputs: List[DriverInput]):
 
     system = request.app.state.system
 
