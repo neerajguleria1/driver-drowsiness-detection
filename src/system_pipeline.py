@@ -152,7 +152,8 @@ class DriverSafetySystem:
         df = pd.DataFrame(validated)[self.MODEL_FEATURES]
 
         try:
-            probabilities = self.model.predict_proba(df)
+            with self.model_lock:
+                probabilities = self.model.predict_proba(df)
         except Exception:
             raise RuntimeError("Batch model inference failure")
 
