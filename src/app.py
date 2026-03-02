@@ -160,7 +160,8 @@ async def analyze_driver(request: Request, input_data: DriverInput):
     try:
         result = await asyncio.to_thread(
             system.analyze,
-            input_data.model_dump()
+            input_data.model_dump(),
+            trace_id
         )
 
         total_latency = time.time() - start_time
@@ -203,3 +204,20 @@ def metrics(request: Request):
 @app.get("/v1/diagnostics")
 def diagnostics(request: Request):
     return request.app.state.system.diagnostics()
+
+@app.get("/v1/audit/recent")
+def get_recent_audit(limit: int = 10):
+
+    import json
+
+    try:
+        with open("logs/driver_audit.log", "r") as f:
+            lines = f.readlines()[-limit:]
+            records = [json.loads(line) for line in lines]
+    except FileNotFoundError:
+        return {"message": "No audit logs yet"}
+
+    return {
+        "count": len(records),
+        "records": records
+    }
