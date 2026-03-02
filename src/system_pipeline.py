@@ -5,7 +5,10 @@ import logging
 import threading
 import time
 from typing import Dict, List, Tuple
-
+import os
+import json
+import queue
+from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +61,34 @@ class DriverSafetySystem:
             self.total_drowsy = 0
             self.total_latency = 0.0
 
+            # ------------------------
+            # MODEL LOCK (FIX YOUR BUG)
+            # ------------------------
+            self.model_lock = threading.Lock()
+
+            # ------------------------
+            # AUDIT LOGGING SETUP
+            # ------------------------
+            os.makedirs("logs", exist_ok=True)
+
+            log_queue = queue.Queue(-1)
+
+            queue_handler = QueueHandler(log_queue)
+
+            file_handler = RotatingFileHandler(
+                "logs/driver_audit.log",
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5
+            )
+            file_handler.setFormatter(logging.Formatter('%(message)s'))
+
+            self.listener = QueueListener(log_queue, file_handler)
+            self.listener.start()
+
+            self.audit_logger = logging.getLogger("audit")
+            self.audit_logger.setLevel(logging.INFO)
+            self.audit_logger.addHandler(queue_handler)
+
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
 
@@ -84,7 +115,7 @@ class DriverSafetySystem:
     # ------------------------
     # MAIN ENTRY
     # ------------------------
-    def analyze(self, input_data: Dict) -> Dict:
+    def analyze(self, input_data: Dict,trace_id:str) -> Dict:
 
         start_time = time.time()
 
@@ -92,7 +123,8 @@ class DriverSafetySystem:
         features = self._prepare_features(input_data)
 
         try:
-            probabilities = self.model.predict_proba(features)[0]
+            with self.model_lock:
+                 probabilities = self.model.predict_proba(features)[0]
         except Exception:
             raise RuntimeError("Model inference failure")
 
@@ -127,6 +159,26 @@ class DriverSafetySystem:
             self.total_latency += latency
             if ml_prediction == "Drowsy":
                 self.total_drowsy += 1
+
+        audit_record = {
+            "trace_id": trace_id,
+            "timestamp": time.time(),
+            "input": input_data,
+            "ml_prediction": ml_prediction,
+            "confidence": ml_confidence,
+            "risk_score": risk_score,
+            "risk_state": risk_state,
+            "decision": decision
+        }
+
+        self.audit_logger.info(json.dumps(audit_record))
+
+        if risk_state == "CRITICAL":
+            self.audit_logger.info(json.dumps({
+                "incident": True,
+                "trace_id": trace_id,
+                "timestamp": time.time()
+            }))
 
         return {
             "ml_prediction": ml_prediction,
