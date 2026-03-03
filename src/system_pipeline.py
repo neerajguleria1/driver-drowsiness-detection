@@ -89,8 +89,138 @@ class DriverSafetySystem:
             self.audit_logger.setLevel(logging.INFO)
             self.audit_logger.addHandler(queue_handler)
 
+            # Shadow model for A/B testing
+            self.shadow_model = None
+            self.shadow_metadata = None
+
+            # Drift detection buffers
+            self.live_feature_buffer = []
+            self.prediction_buffer = []
+            self.baseline_stats = {}
+            self.baseline_drowsy_ratio = 0.0
+            self._drift_lock = threading.Lock()
+
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
+
+    # ------------------------
+    # MODEL VERSIONING
+    # ------------------------
+    def load_model_version(self, version: str):
+        """Dynamically load and switch model without restart"""
+        model_path = f"models/{version}/model.pkl"
+        metadata_path = f"models/{version}/metadata.json"
+
+        if not os.path.exists(model_path):
+            raise ValueError(f"Model version {version} not found")
+
+        new_model = joblib.load(model_path)
+
+        with open(metadata_path) as f:
+            new_metadata = json.load(f)
+
+        # Validate feature compatibility
+        if set(new_model.feature_names_in_) != set(self.MODEL_FEATURES):
+            raise ValueError("Feature mismatch between models")
+
+        # Atomic switch
+        with self.model_lock:
+            self.model = new_model
+            self.model_version = version
+            logger.info(f"Model switched to {version}")
+
+    def load_shadow_model(self, version: str):
+        """Load model for shadow testing without switching"""
+        model_path = f"models/{version}/model.pkl"
+        metadata_path = f"models/{version}/metadata.json"
+
+        if not os.path.exists(model_path):
+            raise ValueError(f"Shadow model version {version} not found")
+
+        self.shadow_model = joblib.load(model_path)
+
+        with open(metadata_path) as f:
+            self.shadow_metadata = json.load(f)
+
+        logger.info(f"Shadow model loaded: {version}")
+
+    def _run_shadow_prediction(self, features: pd.DataFrame) -> Dict:
+        """Run prediction on shadow model and log comparison"""
+        if self.shadow_model is None:
+            return None
+
+        try:
+            shadow_prob = self.shadow_model.predict_proba(features)[0]
+            shadow_pred = "Drowsy" if np.argmax(shadow_prob) == 1 else "Alert"
+            shadow_conf = float(shadow_prob[np.argmax(shadow_prob)])
+
+            return {
+                "prediction": shadow_pred,
+                "confidence": shadow_conf
+            }
+        except Exception as e:
+            logger.warning(f"Shadow prediction failed: {e}")
+            return None
+
+    # ------------------------
+    # DRIFT DETECTION
+    # ------------------------
+    def set_baseline_stats(self, baseline_df: pd.DataFrame, baseline_predictions: List[str]):
+        """Initialize baseline statistics for drift detection"""
+        for feature in self.MODEL_FEATURES:
+            self.baseline_stats[feature] = {
+                "mean": baseline_df[feature].mean(),
+                "std": baseline_df[feature].std()
+            }
+        self.baseline_drowsy_ratio = sum(1 for p in baseline_predictions if p == "Drowsy") / len(baseline_predictions)
+        logger.info("Baseline statistics initialized")
+
+    def detect_drift(self) -> Dict:
+        """Detect data and prediction drift"""
+        with self._drift_lock:
+            if len(self.live_feature_buffer) < 200:
+                return {"status": "Insufficient data"}
+
+            live_df = pd.DataFrame(self.live_feature_buffer)
+            drift_report = {}
+
+            # Feature drift detection
+            for feature in self.MODEL_FEATURES:
+                if feature not in self.baseline_stats:
+                    continue
+
+                live_mean = live_df[feature].mean()
+                live_std = live_df[feature].std()
+                baseline_mean = self.baseline_stats[feature]["mean"]
+                baseline_std = self.baseline_stats[feature]["std"]
+
+                mean_shift = abs(live_mean - baseline_mean) / (abs(baseline_mean) + 1e-6)
+                std_shift = abs(live_std - baseline_std) / (abs(baseline_std) + 1e-6)
+
+                if mean_shift > 0.2:
+                    drift_report[f"{feature}_mean"] = f"Mean shift: {mean_shift:.2%}"
+
+                if std_shift > 0.2:
+                    drift_report[f"{feature}_std"] = f"Variance shift: {std_shift:.2%}"
+
+            # Prediction distribution drift
+            live_drowsy_ratio = sum(1 for p in self.prediction_buffer if p == "Drowsy") / len(self.prediction_buffer)
+            pred_drift = abs(live_drowsy_ratio - self.baseline_drowsy_ratio)
+
+            if pred_drift > 0.15:
+                drift_report["prediction_distribution"] = f"Drowsy ratio shift: {self.baseline_drowsy_ratio:.2%} → {live_drowsy_ratio:.2%}"
+
+            if drift_report:
+                self.audit_logger.warning(json.dumps({
+                    "event": "drift_detected",
+                    "timestamp": time.time(),
+                    "details": drift_report
+                }))
+
+            return {
+                "status": "Drift Warning" if drift_report else "Stable",
+                "details": drift_report
+            }
 
     # ------------------------
     # HEALTH CHECK
@@ -153,12 +283,32 @@ class DriverSafetySystem:
 
         latency = time.time() - start_time
 
+        # Shadow model comparison
+        shadow_result = self._run_shadow_prediction(features)
+        if shadow_result:
+            self.audit_logger.info(json.dumps({
+                "trace_id": trace_id,
+                "shadow_comparison": {
+                    "main_prediction": ml_prediction,
+                    "shadow_prediction": shadow_result["prediction"],
+                    "match": ml_prediction == shadow_result["prediction"]
+                }
+            }))
+
         # Thread-safe metrics update
         with self._metrics_lock:
             self.total_requests += 1
             self.total_latency += latency
             if ml_prediction == "Drowsy":
                 self.total_drowsy += 1
+
+        # Track for drift detection
+        with self._drift_lock:
+            self.live_feature_buffer.append(input_data)
+            self.prediction_buffer.append(ml_prediction)
+            if len(self.live_feature_buffer) > 1000:
+                self.live_feature_buffer.pop(0)
+                self.prediction_buffer.pop(0)
 
         audit_record = {
             "trace_id": trace_id,
@@ -254,6 +404,15 @@ class DriverSafetySystem:
 
         if not required.issubset(provided):
             raise ValueError("Input schema mismatch detected")
+
+        if data["Seatbelt"] not in [0, 1]:
+            raise ValueError("Seatbelt must be 0 or 1")
+
+        if not isinstance(data["Fatigue"], int):
+            raise ValueError("Fatigue must be integer")
+
+        if data["Speed"] < 0:
+            raise ValueError("Speed cannot be negative")
 
     # ------------------------
     # FEATURE PREP

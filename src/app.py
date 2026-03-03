@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List
@@ -7,7 +7,11 @@ import time
 import uuid
 import os
 import asyncio
+import pandas as pd
 from contextlib import asynccontextmanager
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from src.system_pipeline import DriverSafetySystem
 
@@ -30,6 +34,8 @@ MODEL_PATH = os.getenv(
     "MODEL_PATH",
     "models/final_driver_drowsiness_pipeline.pkl"
 )
+
+API_KEY = os.getenv("API_KEY", "dev_secure_key_123")
 
 
 # ------------------------
@@ -68,10 +74,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
 
 # ------------------------
 # GLOBAL ERROR HANDLER
 # ------------------------
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request, exc):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded"}
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
 
@@ -85,6 +101,14 @@ async def global_exception_handler(request: Request, exc: Exception):
             "trace_id": trace_id
         }
     )
+
+
+# ------------------------
+# API KEY VERIFICATION
+# ------------------------
+def verify_api_key(x_api_key: str = Header(...)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ------------------------
@@ -150,7 +174,12 @@ def deep_health(request: Request):
 # MAIN INFERENCE ROUTE
 # ------------------------
 @app.post("/v1/analyze", response_model=DriverAnalysisResponse)
-async def analyze_driver(request: Request, input_data: DriverInput):
+@limiter.limit("10/minute")
+async def analyze_driver(
+    request: Request,
+    input_data: DriverInput,
+    api_key: str = Depends(verify_api_key)
+):
 
     system = request.app.state.system
 
@@ -177,10 +206,20 @@ async def analyze_driver(request: Request, input_data: DriverInput):
         logger.exception(f"[{trace_id}] Inference failed")
         raise HTTPException(status_code=500, detail="Internal inference error")        
 # ------------------------
-# METRICS ENDPOINT
+# BATCH ENDPOINT
 # ------------------------
 @app.post("/v1/analyze/batch")
-async def analyze_batch(request: Request, inputs: List[DriverInput]):
+@limiter.limit("5/minute")
+async def analyze_batch(
+    request: Request,
+    inputs: List[DriverInput],
+    api_key: str = Depends(verify_api_key)
+):
+    if len(inputs) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Batch size too large"
+        )
 
     system = request.app.state.system
 
@@ -221,3 +260,46 @@ def get_recent_audit(limit: int = 10):
         "count": len(records),
         "records": records
     }
+
+
+# ------------------------
+# MODEL VERSIONING ENDPOINTS
+# ------------------------
+@app.post("/v1/model/switch/{version}")
+def switch_model(version: str, request: Request, api_key: str = Depends(verify_api_key)):
+    try:
+        request.app.state.system.load_model_version(version)
+        return {"message": f"Switched to model {version}"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/v1/model/shadow/{version}")
+def load_shadow(version: str, request: Request, api_key: str = Depends(verify_api_key)):
+    try:
+        request.app.state.system.load_shadow_model(version)
+        return {"message": f"Shadow model {version} loaded for testing"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/v1/model/shadow/disable")
+def disable_shadow(request: Request, api_key: str = Depends(verify_api_key)):
+    request.app.state.system.shadow_model = None
+    return {"message": "Shadow model disabled"}
+
+
+# ------------------------
+# DRIFT DETECTION ENDPOINT
+# ------------------------
+@app.get("/v1/drift/detect")
+def detect_drift(request: Request, api_key: str = Depends(verify_api_key)):
+    return request.app.state.system.detect_drift()
+
+@app.post("/v1/drift/baseline")
+def set_baseline(request: Request, api_key: str = Depends(verify_api_key)):
+    system = request.app.state.system
+    if len(system.live_feature_buffer) < 100:
+        raise HTTPException(status_code=400, detail="Insufficient data for baseline")
+    
+    baseline_df = pd.DataFrame(system.live_feature_buffer)[system.MODEL_FEATURES]
+    system.set_baseline_stats(baseline_df, system.prediction_buffer)
+    return {"message": "Baseline statistics set"}
