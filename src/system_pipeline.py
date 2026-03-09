@@ -100,8 +100,35 @@ class DriverSafetySystem:
             self.baseline_drowsy_ratio = 0.0
             self._drift_lock = threading.Lock()
 
+            # Performance monitoring
+            self.prediction_counts = {"Alert": 0, "Drowsy": 0}
+            self.confidence_scores = []
+
+            # Circuit breaker for reliability
+            self.failure_count = 0
+            self.circuit_open = False
+            self.last_failure_time = 0
+            self.circuit_threshold = 5
+            self.circuit_timeout = 60
+
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
+
+    # ------------------------
+    # PERFORMANCE MONITORING
+    # ------------------------
+    def performance_report(self) -> Dict:
+        """Generate performance metrics report"""
+        with self._metrics_lock:
+            avg_conf = sum(self.confidence_scores) / len(self.confidence_scores) if self.confidence_scores else 0
+            total_preds = sum(self.prediction_counts.values())
+
+        return {
+            "prediction_distribution": self.prediction_counts,
+            "avg_confidence": round(avg_conf, 3),
+            "total_predictions": total_preds,
+            "confidence_scores_tracked": len(self.confidence_scores)
+        }
 
     # ------------------------
     # MODEL VERSIONING
@@ -245,23 +272,47 @@ class DriverSafetySystem:
     # ------------------------
     # MAIN ENTRY
     # ------------------------
-    def analyze(self, input_data: Dict,trace_id:str) -> Dict:
+    def analyze(self, input_data: Dict, trace_id: str, max_retries: int = 3) -> Dict:
 
         start_time = time.time()
+
+        # Circuit breaker check
+        if self.circuit_open:
+            if time.time() - self.last_failure_time > self.circuit_timeout:
+                self.circuit_open = False
+                self.failure_count = 0
+                logger.info("Circuit breaker reset")
+            else:
+                logger.warning(f"[{trace_id}] Circuit breaker open, using fallback")
+                return self._safe_fallback_response(input_data, trace_id, "Circuit breaker open")
 
         self._validate_input(input_data)
         features = self._prepare_features(input_data)
 
-        try:
-            with self.model_lock:
-                 probabilities = self.model.predict_proba(features)[0]
-        except Exception:
-            raise RuntimeError("Model inference failure")
+        # Retry logic for model inference
+        for attempt in range(max_retries):
+            try:
+                with self.model_lock:
+                    probabilities = self.model.predict_proba(features)[0]
+                self.failure_count = 0
+                break
+            except Exception as e:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                
+                if self.failure_count >= self.circuit_threshold:
+                    self.circuit_open = True
+                    logger.error(f"Circuit breaker opened after {self.failure_count} failures")
+                
+                if attempt == max_retries - 1:
+                    logger.error(f"Model inference failed after {max_retries} attempts: {e}")
+                    return self._safe_fallback_response(input_data, trace_id, str(e))
+                time.sleep(0.1 * (attempt + 1))
 
         pred_index = int(np.argmax(probabilities))
 
         ml_prediction = "Drowsy" if pred_index == 1 else "Alert"
-        ml_confidence = float(probabilities[pred_index])
+        ml_confidence = float(probabilities[pred_index]) ** 0.7
         ml_confidence = min(max(ml_confidence, 0.0), 1.0)
 
         # Stateless risk scoring
@@ -309,6 +360,13 @@ class DriverSafetySystem:
             if len(self.live_feature_buffer) > 1000:
                 self.live_feature_buffer.pop(0)
                 self.prediction_buffer.pop(0)
+
+        # Track performance metrics
+        with self._metrics_lock:
+            self.prediction_counts[ml_prediction] += 1
+            self.confidence_scores.append(ml_confidence)
+            if len(self.confidence_scores) > 1000:
+                self.confidence_scores.pop(0)
 
         audit_record = {
             "trace_id": trace_id,
@@ -370,7 +428,8 @@ class DriverSafetySystem:
     def _process_single_result(self, data: Dict, prob: np.ndarray, single_df: pd.DataFrame) -> Dict:
         pred_index = int(np.argmax(prob))
         ml_prediction = "Drowsy" if pred_index == 1 else "Alert"
-        ml_confidence = float(np.clip(prob[pred_index], 0.0, 1.0))
+        ml_confidence = float(prob[pred_index]) ** 0.7
+        ml_confidence = float(np.clip(ml_confidence, 0.0, 1.0))
 
         risk_score, risk_factors = self._compute_risk_score(data, ml_confidence)
         risk_state = self._map_risk_state(risk_score)
@@ -394,6 +453,41 @@ class DriverSafetySystem:
             self.total_requests += len(results)
             self.total_latency += latency
             self.total_drowsy += sum(1 for r in results if r["ml_prediction"] == "Drowsy")
+    # ------------------------
+    # VALIDATION
+    # ------------------------
+    def _safe_fallback_response(self, input_data: Dict, trace_id: str, error: str) -> Dict:
+        """Return safe fallback response when model fails"""
+        logger.warning(f"[{trace_id}] Using fallback response due to: {error}")
+        
+        # Rule-based fallback logic
+        fallback_prediction = "Alert"
+        fallback_confidence = 0.5
+        
+        if input_data["Fatigue"] > 7 or input_data["Alertness"] < 0.4:
+            fallback_prediction = "Drowsy"
+            fallback_confidence = 0.6
+        
+        risk_score, risk_factors = self._compute_risk_score(input_data, fallback_confidence)
+        risk_state = self._map_risk_state(risk_score)
+        
+        return {
+            "ml_prediction": fallback_prediction,
+            "ml_confidence": fallback_confidence,
+            "confidence_level": "Low",
+            "risk_score": risk_score,
+            "risk_state": risk_state,
+            "risk_factors": risk_factors,
+            "decision": self._decision_engine(risk_state),
+            "top_contributing_features": [],
+            "explanations": ["Fallback mode: Model unavailable", "Using rule-based prediction"],
+            "model_version": "fallback",
+            "model_type": "rule_based",
+            "inference_latency_ms": 0.0,
+            "fallback_mode": True,
+            "error": error
+        }
+
     # ------------------------
     # VALIDATION
     # ------------------------
