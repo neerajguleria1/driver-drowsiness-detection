@@ -14,6 +14,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from src.system_pipeline import DriverSafetySystem
+from src.cv_api import router as cv_router
 
 
 # ------------------------
@@ -76,6 +77,9 @@ app = FastAPI(
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
+
+# Include Computer Vision Router
+app.include_router(cv_router)
 
 
 # ------------------------
@@ -151,6 +155,8 @@ class DriverAnalysisResponse(BaseModel):
     model_type: str
     inference_latency_ms: float
     trace_id: str
+    fallback_mode: bool = False
+    error: str = None
 
 
 # ------------------------
@@ -187,10 +193,14 @@ async def analyze_driver(
     start_time = time.time()
 
     try:
-        result = await asyncio.to_thread(
-            system.analyze,
-            input_data.model_dump(),
-            trace_id
+        # Timeout protection: 5 seconds max
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                system.analyze,
+                input_data.model_dump(),
+                trace_id
+            ),
+            timeout=5.0
         )
 
         total_latency = time.time() - start_time
@@ -199,10 +209,14 @@ async def analyze_driver(
         result["trace_id"] = trace_id
         return result
 
+    except asyncio.TimeoutError:
+        logger.error(f"[{trace_id}] Request timeout")
+        raise HTTPException(status_code=504, detail="Request timeout")
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    except Exception:
+    except Exception as e:
         logger.exception(f"[{trace_id}] Inference failed")
         raise HTTPException(status_code=500, detail="Internal inference error")        
 # ------------------------
@@ -303,3 +317,11 @@ def set_baseline(request: Request, api_key: str = Depends(verify_api_key)):
     baseline_df = pd.DataFrame(system.live_feature_buffer)[system.MODEL_FEATURES]
     system.set_baseline_stats(baseline_df, system.prediction_buffer)
     return {"message": "Baseline statistics set"}
+
+
+# ------------------------
+# PERFORMANCE MONITORING
+# ------------------------
+@app.get("/v1/model/performance")
+def model_performance(request: Request, api_key: str = Depends(verify_api_key)):
+    return request.app.state.system.performance_report()

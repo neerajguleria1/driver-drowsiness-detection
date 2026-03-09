@@ -1,0 +1,12 @@
+# Enhanced CV Requirements
+opencv-python>=4.5.0
+scipy>=1.7.0
+numpy>=1.21.0
+
+# Optional: For advanced facial landmarks (download shape_predictor_68_face_landmarks.dat)
+# dlib>=19.22.0
+
+# Note: To enable advanced features:
+# 1. Install dlib: pip install dlib
+# 2. Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+# 3. Extract to project root directory
